@@ -8,6 +8,7 @@
 #include <fstream>
 #include <random>
 #include <atomic>
+#include <iomanip>
 
 struct Order
 {
@@ -19,7 +20,6 @@ struct Order
 class OrderPipeline
 {
 private:
-  // Static members for thread communication
   static std::queue<Order> rawQueue;
   static std::queue<Order> validatedQueue;
   static std::mutex rawMtx;
@@ -31,6 +31,7 @@ private:
   static std::atomic<int> validCount;
   static std::atomic<int> invalidCount;
   static std::atomic<double> regionalRevenue[5];
+  static std::atomic<int> regionalOrderCount[5];
 
 public:
   static void producerWork(std::stop_token st)
@@ -53,7 +54,7 @@ public:
     {
       std::unique_lock<std::mutex> lock(rawMtx);
       rawCV.wait(lock, [st]
-                 { return st.stop_requested() || !rawQueue.empty(); });
+                { return st.stop_requested() || !rawQueue.empty(); });
 
       if (!rawQueue.empty())
       {
@@ -69,6 +70,7 @@ public:
             validatedQueue.push(order);
             validCount++;
             regionalRevenue[order.regionCode] += order.orderAmount;
+            regionalOrderCount[order.regionCode]++;
           }
           validCV.notify_one();
         }
@@ -86,7 +88,7 @@ public:
     {
       std::unique_lock<std::mutex> lock(validMtx);
       validCV.wait(lock, [st, regionId]
-                   { return st.stop_requested() || (!validatedQueue.empty() && validatedQueue.front().regionCode == regionId); });
+                  { return st.stop_requested() || (!validatedQueue.empty() && validatedQueue.front().regionCode == regionId); });
 
       if (!validatedQueue.empty() && validatedQueue.front().regionCode == regionId)
       {
@@ -130,15 +132,34 @@ public:
       routers.emplace_back(routerWork, i);
 
     producers.clear(); // jthreads join automatically here [cite: 53]
-    rawCV.notify_all();
 
     for (auto &f : filters)
       f.request_stop();
+    rawCV.notify_all();
     filters.clear();
 
     for (auto &r : routers)
       r.request_stop();
+    validCV.notify_all();
     routers.clear();
+
+    static const char *regionNames[5] = {"West", "Central", "East", "North", "South"};
+    double totalRevenue = 0;
+    int totalValid = 0;
+    int totalInvalid = invalidCount;
+    std::cout << "Order Processing Pipeline Results\n";
+    std::cout << "==================================\n";
+    for (int i = 0; i < 5; ++i)
+    {
+      std::cout << "Region " << i << " (" << regionNames[i] << "): "
+                << regionalOrderCount[i] << " orders, Total Revenue: $"
+                << std::fixed << std::setprecision(2) << regionalRevenue[i] << std::endl;
+      totalRevenue += regionalRevenue[i];
+      totalValid += regionalOrderCount[i];
+    }
+    std::cout << "Total Valid Orders: " << totalValid << std::endl;
+    std::cout << "Total Invalid Orders: " << totalInvalid << std::endl;
+    std::cout << "Pipeline processing completed successfully.\n";
   }
 };
 
@@ -152,6 +173,7 @@ std::atomic<int> OrderPipeline::totalOrders{0};
 std::atomic<int> OrderPipeline::validCount{0};
 std::atomic<int> OrderPipeline::invalidCount{0};
 std::atomic<double> OrderPipeline::regionalRevenue[5] = {0, 0, 0, 0, 0};
+std::atomic<int> OrderPipeline::regionalOrderCount[5] = {0, 0, 0, 0, 0};
 
 int main()
 {
