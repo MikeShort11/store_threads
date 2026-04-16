@@ -50,69 +50,78 @@ public:
 
   static void filterWork(std::stop_token st)
   {
-    while (!st.stop_requested())
+    while (true)
     {
       std::unique_lock<std::mutex> lock(rawMtx);
       rawCV.wait(lock, [st]
-                { return st.stop_requested() || !rawQueue.empty(); });
+                { return (!rawQueue.empty()) || (st.stop_requested() && rawQueue.empty()); });
 
-      if (!rawQueue.empty())
+      if (rawQueue.empty() && st.stop_requested())
+        break;
+      if (rawQueue.empty())
+        continue;
+
+      Order order = rawQueue.front();
+      rawQueue.pop();
+      lock.unlock(); // Unlock early for better concurrency [cite: 42]
+
+      if (order.orderAmount >= 50.0 && order.orderId >= 0)
       {
-        Order order = rawQueue.front();
-        rawQueue.pop();
-
-        lock.unlock(); // Unlock early for better concurrency [cite: 42]
-
-        if (order.orderAmount >= 50.0 && order.orderId >= 0)
         {
-          {
-            std::lock_guard<std::mutex> validLock(validMtx);
-            validatedQueue.push(order);
-            validCount++;
-            regionalRevenue[order.regionCode] += order.orderAmount;
-            regionalOrderCount[order.regionCode]++;
-          }
-          validCV.notify_one();
+          std::lock_guard<std::mutex> validLock(validMtx);
+          validatedQueue.push(order);
+          validCount++;
+          regionalRevenue[order.regionCode] += order.orderAmount;
+          regionalOrderCount[order.regionCode]++;
         }
-        else
-        {
-          invalidCount++;
-        }
+        validCV.notify_all();
+      }
+      else
+      {
+        invalidCount++;
       }
     }
   }
 
   static void routerWork(std::stop_token st, int regionId)
   {
-    while (!st.stop_requested())
+    std::vector<Order> localBuffer;
+    while (true)
     {
       std::unique_lock<std::mutex> lock(validMtx);
       validCV.wait(lock, [st, regionId]
-                  { return st.stop_requested() || (!validatedQueue.empty() && validatedQueue.front().regionCode == regionId); });
+                  { return (!validatedQueue.empty() && validatedQueue.front().regionCode == regionId) || (st.stop_requested() && (validatedQueue.empty() || validatedQueue.front().regionCode != regionId)); });
 
-      if (!validatedQueue.empty() && validatedQueue.front().regionCode == regionId)
-      {
-        Order order = validatedQueue.front();
-        validatedQueue.pop();
+      if ((validatedQueue.empty() || validatedQueue.front().regionCode != regionId) && st.stop_requested())
+        break;
+      if (validatedQueue.empty() || validatedQueue.front().regionCode != regionId)
+        continue;
 
-        lock.unlock(); // Unlock early for better concurrency [cite: 42]
+      Order order = validatedQueue.front();
+      validatedQueue.pop();
+      lock.unlock();
 
-        try
-        {
-          std::ofstream outFile("region_" + std::to_string(regionId) + "_orders.txt", std::ios::app);
-          if (outFile.is_open())
-          {
-            outFile << "Order ID: " << order.orderId << ", Amount: " << order.orderAmount << ", Region: " << order.regionCode << std::endl;
+      // Try to write all buffered orders first
+      bool writeSuccess = false;
+      try {
+        std::ofstream outFile("region_" + std::to_string(regionId) + ".txt", std::ios::app);
+        if (outFile.is_open()) {
+          // Flush buffer
+          for (const auto& bufferedOrder : localBuffer) {
+            outFile << bufferedOrder.orderId << ", " << bufferedOrder.orderAmount << std::endl;
           }
-          else
-          {
-            std::cerr << "Failed to open file for region " << regionId << std::endl;
-          }
+          localBuffer.clear();
+          // Write current order
+          outFile << order.orderId << ", " << order.orderAmount << std::endl;
+          writeSuccess = true;
+        } else {
+          std::cerr << "Failed to open file for region " << regionId << std::endl;
         }
-        catch (const std::exception &e)
-        {
-          std::cerr << "Error writing to file for region " << regionId << ": " << e.what() << std::endl;
-        }
+      } catch (const std::exception &e) {
+        std::cerr << "Error writing to file for region " << regionId << ": " << e.what() << std::endl;
+      }
+      if (!writeSuccess) {
+        localBuffer.push_back(order);
       }
     }
   }
